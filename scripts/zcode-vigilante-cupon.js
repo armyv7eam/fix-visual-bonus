@@ -175,8 +175,22 @@ async function previewCampanas() {
   const out = [];
   for (const c of filtrarCuentas(await cuentas(), CFG)) {
     const prev = await apiGet(`/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`, c.jwt);
-    const planes = prev.json?.data?.plans || [];
-    if (planes.length) out.push({ cuenta: c, campanas: planes });
+    // La forma de la respuesta no esta garantizada: cuando no hay nada el servidor
+    // devuelve {code:0} sin `data`; cuando hay, `data` trae la lista (plans/campaigns/
+    // deliveries/items) o el objeto de campana. Se acepta cualquier `data` con contenido.
+    const data = prev.json?.data;
+    let campanas = [];
+    if (Array.isArray(data)) campanas = data;
+    else if (data && typeof data === 'object') {
+      for (const k of ['plans', 'campaigns', 'deliveries', 'items', 'list']) {
+        if (Array.isArray(data[k])) { campanas = data[k]; break; }
+      }
+      if (!campanas.length && Object.keys(data).length) campanas = [data];
+    }
+    if (campanas.length) {
+      log('campana detectada en ' + c.email + ': ' + JSON.stringify(campanas).slice(0, 300));
+      out.push({ cuenta: c, campanas });
+    }
     await sleep(400);
   }
   return out;

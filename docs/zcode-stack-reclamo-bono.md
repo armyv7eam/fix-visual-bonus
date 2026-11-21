@@ -247,6 +247,22 @@ Se verificó en profundidad que **no existe forma de auto-otorgarse un bono**:
 **Conclusión:** lo único que se puede perder es la *ventana*, no el *derecho*. El trabajo se concentró
 entonces en detectar y reclamar lo más rápido posible, no en intentar abrir la puerta.
 
+#### La cohorte también se decide por fecha de cuenta
+
+Un login OAuth **nuevo** no garantiza nada: se verificó con una cuenta creada durante la campaña
+`wk-1120` (que ya estaba abierta) y el resultado fue `plans: []`, `balances: []` y
+`billing/preview` sin `data`, es decir, una sesión válida pero **fuera de la cohorte** de esa
+campaña. Las cuentas que sí recibieron el bono ya existían cuando la campaña arrancó.
+
+En el cliente no hay ninguna maquinaria de referido: los `plan_id` con sufijo `-referral` existen
+en el servidor, pero en `app.asar` no aparece ningún endpoint ni parámetro de *referral* /
+*invite* / *promo* de Z.ai (las coincidencias de "referral" del bundle son del SDK de Feishu
+embebido, sin relación).
+
+**Lo único que queda es la ventana de las próximas campañas:** la única forma de tener una entrega
+es que la campaña esté viva y que la cuenta esté en su cohorte. Por eso conviene dejar el vigilante
+en modo `--auto` (§5.3): detecta la campaña en cuanto aparece y la reclama en el acto.
+
 ### 3.6 El "cupón diario de 300 M" no existe en el build actual
 
 Existe documentado en fuentes públicas (campaña "Global Building": 300 M GLM-5.3-Flash/día, reclamo desde
@@ -330,13 +346,29 @@ node scripts/zcode-vigilante-cupon.js --once --auto    # una pasada reclamando
 
 ### 5.3 Estado actual del vigilante
 
-**No está armado**: no hay tarea programada de Windows ni proceso corriendo. Los scripts quedan listos para lanzarse a mano cuando se quiera.
-
-Para instalarlo como tarea de Windows (funciona como usuario normal, sin elevación):
+Los scripts quedan listos para lanzarse a mano cuando se quiera. Para instalarlo como tarea de
+Windows (funciona como usuario normal, sin elevación) conviene apuntar a un `.cmd` propio, porque
+la tarea necesita variables de entorno (la bóveda, sobre todo) y las comillas de `schtasks` en
+PowerShell son traicioneras:
 
 ```powershell
-schtasks /create /tn "ZCode vigilante cupones" /tr "node ""C:\...\zcode-vigilante-cupon.js"" --once" /sc minute /mo 15 /f
+# .cmd: fija ZCODE_VAULT y hace UNA pasada (no consume entrega si no hay campaña)
+@echo off
+set ZCODE_VAULT=%USERPROFILE%\...\vault\sessions.vault
+cd /d "%...\scripts"
+node zcode-vigilante-cupon.js --once --auto >> "%USERPROFILE%\.zcode\vigilante-cupon.log" 2>&1
+
+schtasks /create /tn "ZCode vigilante cupones" /tr "C:\...\.zcode\zcode-vigilante-cupon.cmd" /sc minute /mo 15 /f
 ```
+
+Con `--once --auto` la tarea **no queda residente**: cada 15 minutos sondea `billing/preview` de
+todas las cuentas de la bóveda (que no consume entrega) y solo si aparece una campaña entra al flujo
+de reclamo (rotar → `marketing/touch` → clic real por CDP → verificar → restaurar). Si no hay nada,
+la pasada termina en segundos y no toca la sesión ni reinicia la app.
+
+> La detección de campañas acepta cualquier forma de respuesta con contenido (`data.plans`,
+> `data.campaigns`, `data.deliveries` o un objeto suelto): el servidor no garantiza una sola
+> estructura y antes devolvía `{code:0}` sin `data` cuando no había nada.
 
 ---
 
@@ -426,6 +458,17 @@ Al arrancar, el host tiene **tres** caminos distintos. Elegir mal = `logout` aut
 
 **Clave**: `zcodejwttoken` **no tiene `exp`** (claims: `user_id, token_version, sub, iat`).
 Por eso nunca expira y el camino cacheado siempre es viable.
+
+> **En la app 3.18.2 el provider `zai` además de hacer logout cambia el esquema del archivo.**
+> Cuando el host entra por el camino `zai` y falla la validación, reescribe
+> `~/.zcode/v2/credentials.json` con el esquema nuevo (`account-provider:*:identity`,
+> `account-provider:*:auth-source`, `oauth:session_revision`, `oauth:login_attribution`) y
+> **elimina `zcodejwttoken`**. Verificado descifrando el archivo en memoria: el JWT ya no está en
+> ninguna de las claves, la app queda en la pantalla de login y cualquier herramienta que lea el
+> token de ahí falla con `credentials.json no tiene zcodejwttoken`.
+>
+> Por eso **toda rotación debe usar `--provider zai_cn`**: con `zai_cn` la sesión sobrevive al
+> arranque y el `zcodejwttoken` sigue en el archivo.
 
 ### 9.3 El método que funciona: provider `zai_cn`
 
