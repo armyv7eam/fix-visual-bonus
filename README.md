@@ -226,6 +226,21 @@ Dos cosas que hay que saber antes de usarlo:
    está en la lista: el gateway devolvería `405 / 3012` aunque el token y la cuenta estén bien.
    Pon el runtime en `glm-0.17.0/` (en la raíz del repo, o junto al script) o apunta
    `ZCODE_GATEWAY_RUNTIME_DIR` a la carpeta que lo tenga.
+3. **El token puede venir de una bóveda de sesiones, no solo de la app.** La app de escritorio
+   3.18.2 cambió el esquema de `~/.zcode/v2/credentials.json` y ya no guarda la clave
+   `zcodejwttoken`: el gateway llegaría al runtime sin token y el turno fallaría con
+   `model_request_failed / credentials.json no tiene zcodejwttoken`. Con `ZCODE_VAULT` apuntando a
+   una bóveda cifrada (formato `sessions.vault`, clave AES-256-GCM en el keyring del sistema), el
+   gateway resuelve el token por su cuenta y **deja de depender de que la app tenga sesión abierta**.
+   Si no se indica cuenta (`ZCODE_VAULT_ACCOUNT`), el gateway elige la sesión de la bóveda que
+   tenga un Start Plan activo (lo consulta con `billing/balance`, que es de solo lectura).
+
+```bash
+# modo bóveda (independiente de la app)
+ZCODE_VAULT=/ruta/a/sessions.vault node scripts/plan-gateway-win.cjs
+# o fijando la cuenta
+ZCODE_VAULT=/ruta/a/sessions.vault ZCODE_VAULT_ACCOUNT=cuenta@example.com node scripts/plan-gateway-win.cjs
+```
 
 Detalle completo, con el método para capturar la petición real del runtime y hacer el bisect:
 [`docs/zcode-start-plan-como-provider.md`](docs/zcode-start-plan-como-provider.md) §3.1.
@@ -248,6 +263,9 @@ Detalle completo, con el método para capturar la petición real del runtime y h
 | `ZCODE_GATEWAY_RUNTIME_DIR` | `<repo>\glm-0.17.0` | Carpeta con el runtime CLI 0.17.0 (`zcode.cjs` + `provider/`) |
 | `ZCODE_CLI_ENTRY` | — | Ruta directa a un `zcode.cjs` alternativo |
 | `ZCODE_GATEWAY_BUILTIN` | — | Ruta directa a un `zcode-builtin.json` alternativo |
+| `ZCODE_VAULT` | — | Bóveda de sesiones cifrada desde la que el gateway saca el token del plan |
+| `ZCODE_VAULT_ACCOUNT` | — | Cuenta de la bóveda a usar; sin ella se elige la que tenga plan activo |
+| `ZCODE_PROBE_APP_VERSION` | `3.18.2` | Versión que se manda al sondear `billing/balance` para elegir cuenta |
 
 ---
 

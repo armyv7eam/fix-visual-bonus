@@ -472,6 +472,14 @@ codex
    lista de clientes oficiales aunque el token, la cuenta y el provider sean los mismos (§3.1).
 10. **El runtime que trae la app de escritorio puede no servir para el Start Plan.** En 3.18.2
     (CLI 0.17.1) el prompt ya no es reconocido; el CLI 0.17.0 sí. El gateway local usa el 0.17.0.
+11. **La app 3.18.2 cambió el esquema de `credentials.json`.** Ya no guarda la clave
+    `zcodejwttoken`: la sesión quedó repartida en `account-provider:*:identity`,
+    `account-provider:*:auth-source` y `oauth:session_revision`, y el JWT no aparece en ninguno de
+    ellos. Un gateway que solo sepa leer `zcodejwttoken` falla con
+    `model_request_failed / credentials.json no tiene zcodejwttoken` aunque la app esté conectada.
+    Solución robusta: que el gateway resuelva el token desde una **bóveda de sesiones propia**
+    (`ZCODE_VAULT`), que sobrevive a los cambios de esquema de la app y además permite gastar la
+    cuota con la app cerrada.
 
 ---
 
@@ -493,6 +501,8 @@ codex
 | El provider `zcode` de Paseo (`extends: acp`) | Existe pero está **deshabilitado** |
 | El método de auth en el runtime de Windows 3.18.2 | Verificado (`interaction/requestProviderRuntimeHeaders`) |
 | El Coding Plan de Z.ai con API key propia desde un harness externo | Documentado por el proveedor; no probado aquí (sin saldo de API) |
+| La app 3.18.2 ya no guarda `zcodejwttoken` en `credentials.json` | Verificado (descifrado en memoria: las 5 claves restantes no contienen el JWT) |
+| El gateway resuelve el token desde una bóveda de sesiones (`ZCODE_VAULT`) y elige la cuenta con plan activo | Verificado en vivo (`token resuelto desde la boveda` + respuesta `GLM-5.3-Flash` por `127.0.0.1:3129`) |
 
 ---
 

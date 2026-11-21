@@ -65,6 +65,17 @@ const ENTRY = process.env.ZCODE_CLI_ENTRY || (LOCAL_ENTRY || path.join(APP_DIR, 
 const BUILTIN = process.env.ZCODE_GATEWAY_BUILTIN || (LOCAL_BUILTIN || path.join(APP_DIR, 'config', 'provider', 'zcode-builtin.json'))
 const CREDS = path.join(process.env.ZCODE_V2_DIR || path.join(HOME, '.zcode', 'v2'), 'credentials.json')
 const PROVIDER_CONFIG = path.join(process.env.ZCODE_V2_DIR || path.join(HOME, '.zcode', 'v2'), 'provider_config.json')
+/* Boveda de sesiones (opcional). La app de escritorio 3.18.2 cambio el esquema de
+ * ~/.zcode/v2/credentials.json (ya no guarda `zcodejwttoken`), asi que el gateway
+ * puede leer el token de una boveda propia, cifrada, sin depender de la app.
+ *   ZCODE_VAULT           -> ruta del archivo .vault
+ *   ZCODE_VAULT_ACCOUNT   -> correo de la cuenta a usar (opcional: si falta, se
+ *                           elige la sesion de la boveda que tenga plan activo) */
+const VAULT_FILE = process.env.ZCODE_VAULT || null
+const VAULT_ACCOUNT = process.env.ZCODE_VAULT_ACCOUNT || null
+const VAULT_KEYRING_SERVICE = 'ZCode Vault Key'
+const PROBE_APP_VERSION = process.env.ZCODE_PROBE_APP_VERSION || '3.18.2'
+const PROBE_PLATFORM = 'win32-x64'
 const KEYRING_DIR = path.join(__dirname, '.zcode-keyring')
 const ASAR = path.join(process.env.ZCODE_APP_DIR || 'C:\\Program Files\\ZCode\\resources', 'app.asar')
 const ASAR_UNPACKED = path.join(process.env.ZCODE_APP_DIR || 'C:\\Program Files\\ZCode\\resources', 'app.asar.unpacked')
@@ -105,21 +116,142 @@ const sha256hex = (p) => crypto.createHash('sha256').update(p).digest('hex')
 
 /* ------------------------------ credenciales ------------------------------ */
 async function readPlanAuth() {
+  return await resolvePlanToken(false)
+}
+
+/* ---------------------------- boveda de sesiones --------------------------- */
+async function getVaultKey() {
+  const entry = new AsyncEntry(VAULT_KEYRING_SERVICE, sha256hex(path.resolve(VAULT_FILE)), { linux: { store: 'secret-service' } })
+  let secret = await entry.getPassword()
+  if (!secret) {
+    secret = crypto.randomBytes(32).toString('base64url')
+    await entry.setPassword(secret)
+  }
+  return Buffer.from(secret, 'base64url')
+}
+function decryptVault(blob, key) {
+  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(blob.iv, 'base64url'))
+  d.setAuthTag(Buffer.from(blob.tag, 'base64url'))
+  return JSON.parse(Buffer.concat([d.update(Buffer.from(blob.data, 'base64url')), d.final()]).toString('utf8'))
+}
+async function loadVaultSessions() {
+  if (!VAULT_FILE || !fs.existsSync(VAULT_FILE)) return []
+  try {
+    const key = await getVaultKey()
+    const v = decryptVault(JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8')), key)
+    return Object.values(v.sessions || {})
+  } catch (e) {
+    console.error('[gateway] no se pudo leer la boveda: ' + e.message)
+    return []
+  }
+}
+function readDeviceMid() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(path.dirname(CREDS), 'telemetry-state.json'), 'utf8')).deviceMid || null
+  } catch { return null }
+}
+const PROBE_HEADERS = (token) => {
+  const h = {
+    'User-Agent': `ZCode/${PROBE_APP_VERSION}`,
+    'HTTP-Referer': 'https://zcode.z.ai',
+    'X-Title': 'Z Code@electron',
+    'X-Client-Language': 'en-US',
+    'X-ZCode-App-Version': PROBE_APP_VERSION,
+    'X-Platform': PROBE_PLATFORM,
+    'X-Os-Category': 'windows',
+    'Authorization': `Bearer ${token}`,
+    'x-api-key': token,
+  }
+  const mid = readDeviceMid()
+  if (mid) h['X-Device-Mid'] = mid
+  return h
+}
+/** Consulta (solo lectura) si el token tiene un Start Plan activo. */
+async function planIsActive(token) {
+  try {
+    const url = `https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=${PROBE_APP_VERSION}`
+    const res = await fetch(url, { headers: PROBE_HEADERS(token) })
+    if (!res.ok) return false
+    const json = await res.json()
+    const plans = json?.data?.plans
+    return Array.isArray(plans) && plans.length > 0
+  } catch { return false }
+}
+
+/* Token del Start Plan. Se resuelve en este orden:
+ *   1. boveda (si hay ZCODE_VAULT): sesion indicada o la primera con plan activo
+ *   2. ~/.zcode/v2/credentials.json: clave `zcodejwttoken` o, si la app cambio el
+ *      esquema, cualquier valor cifrado que se descifre a un JWT
+ */
+let cachedToken = null
+let cachedTokenAt = 0
+async function resolvePlanToken(force) {
+  if (!force && cachedToken && Date.now() - cachedTokenAt < 5 * 60 * 1000) return cachedToken
+
+  if (VAULT_FILE) {
+    const sessions = await loadVaultSessions()
+    const wanted = VAULT_ACCOUNT ? sessions.filter((s) => String(s.email || '').toLowerCase() === VAULT_ACCOUNT.toLowerCase()) : sessions
+    for (const s of wanted) {
+      if (!s.zcodejwttoken) continue
+      if (await planIsActive(s.zcodejwttoken)) {
+        cachedToken = s.zcodejwttoken; cachedTokenAt = Date.now()
+        console.log(`[gateway] token resuelto desde la boveda: ${s.email}`)
+        return cachedToken
+      }
+    }
+    if (wanted.length) {
+      // la cuenta existe pero no tiene plan: se usa igual (p.ej. para diagnósticos)
+      const s = wanted.find((x) => x.zcodejwttoken)
+      if (s) {
+        cachedToken = s.zcodejwttoken; cachedTokenAt = Date.now()
+        console.log(`[gateway] token de la boveda sin plan activo: ${s.email}`)
+        return cachedToken
+      }
+    }
+  }
+
+  const fromCreds = await readCredsToken()
+  if (fromCreds) {
+    cachedToken = fromCreds; cachedTokenAt = Date.now()
+    console.log('[gateway] token resuelto desde credentials.json')
+    return cachedToken
+  }
+  throw new Error('no hay token de Start Plan: revisa la boveda (ZCODE_VAULT) o la sesion activa de ZCode')
+}
+
+async function readCredsToken() {
   const entry = new AsyncEntry('ZCode Credential Encryption', sha256hex(path.resolve(CREDS)), { linux: { store: 'secret-service' } })
   const secret = await entry.getPassword()
   if (!secret) throw new Error('no hay clave de credenciales en el keyring de Windows')
   const key = Buffer.from(secret, 'base64url')
   const creds = JSON.parse(fs.readFileSync(CREDS, 'utf8'))
-  const v = creds['zcodejwttoken']
-  if (typeof v !== 'string') throw new Error('credentials.json no tiene zcodejwttoken')
-  if (!v.startsWith('enc:v2:')) return v
-  const p = v.slice(7).split(':')
-  if (p.length !== 3 || p[0] !== 'os') throw new Error('formato de credencial inesperado')
-  if (sha256hex(key).slice(0, 24) !== p[1]) throw new Error('la clave del keyring no corresponde a este credentials.json')
-  const [iv, tag, data] = p[2].split('.').map((x) => Buffer.from(x, 'base64url'))
-  const d = crypto.createDecipheriv('aes-256-gcm', key, iv)
-  d.setAuthTag(tag)
-  return Buffer.concat([d.update(data), d.final()]).toString('utf8')
+  const decrypt = (v) => {
+    if (typeof v !== 'string' || !v.startsWith('enc:v2:')) return null
+    const p = v.slice(7).split(':')
+    if (p.length !== 3 || p[0] !== 'os') return null
+    const [, keyId, payload] = p
+    if (sha256hex(key).slice(0, 24) !== keyId) return null
+    const [iv, tag, data] = payload.split('.').map((x) => Buffer.from(x, 'base64url'))
+    const d = crypto.createDecipheriv('aes-256-gcm', key, iv)
+    d.setAuthTag(tag)
+    return Buffer.concat([d.update(data), d.final()]).toString('utf8')
+  }
+  const plain = (v) => { try { return decrypt(v) } catch { return null } }
+  const legacy = creds['zcodejwttoken']
+  if (typeof legacy === 'string') {
+    if (!legacy.startsWith('enc:v2:')) return legacy
+    const p = plain(legacy)
+    if (p) return p
+  }
+  // esquema nuevo: se busca cualquier valor que se descifre a un JWT
+  for (const [k, v] of Object.entries(creds)) {
+    const p = plain(v)
+    if (p && /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./.test(p)) {
+      console.log(`[gateway] token encontrado en la clave "${k}"`)
+      return p
+    }
+  }
+  return null
 }
 
 /* ------------------------------ configuracion ------------------------------ */
