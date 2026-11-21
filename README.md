@@ -91,10 +91,12 @@ fix-visual-bonus/
 │   ├── zcode-claim-banner.js        # reclamador por CDP (clic real en el banner)
 │   ├── zcode-claim-retry.js         # reclamador con reintentos + verificación real
 │   ├── zcode-switch-cuenta.js       # rota / lista / restaura la cuenta activa
-│   └── zcode-vigilante-cupon.js     # vigilante: --avisar (por defecto) o --auto
+│   ├── zcode-vigilante-cupon.js     # vigilante: --avisar (por defecto) o --auto
+│   └── zcode-provider-check.js      # ¿el plan sirve desde un cliente externo?
 └── docs/
-    ├── zcode-stack-reclamo-bono.md  # el stack paso a paso + los hallazgos
-    └── zcode-cuentas-inventario.md  # informe técnico: API, campañas, trampas
+    ├── zcode-stack-reclamo-bono.md      # el stack paso a paso + los hallazgos
+    ├── zcode-start-plan-como-provider.md # usar el plan como provider en otros harnesses
+    └── zcode-cuentas-inventario.md      # informe técnico: API, campañas, trampas
 ```
 
 ---
@@ -244,5 +246,8 @@ schtasks /create /tn "ZCode vigilante cupones" /tr "node ""<repo>\scripts\zcode-
 
 - [docs/zcode-stack-reclamo-bono.md](docs/zcode-stack-reclamo-bono.md) — el stack paso a paso, los
   hallazgos y cómo hacerlo en otra cuenta sin login OAuth.
+- [docs/zcode-start-plan-como-provider.md](docs/zcode-start-plan-como-provider.md) — si los tokens
+  del plan se pueden gastar desde Claude Code, Codex CLI, OpenCode o un MCP server: qué funciona,
+  qué no y por qué.
 - [docs/zcode-cuentas-inventario.md](docs/zcode-cuentas-inventario.md) — informe técnico: formas de
   la API, historial de campañas, trampas y el hallazgo del consumo de entregas.
