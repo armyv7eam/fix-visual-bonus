@@ -92,7 +92,8 @@ fix-visual-bonus/
 │   ├── zcode-claim-retry.js         # reclamador con reintentos + verificación real
 │   ├── zcode-switch-cuenta.js       # rota / lista / restaura la cuenta activa
 │   ├── zcode-vigilante-cupon.js     # vigilante: --avisar (por defecto) o --auto
-│   └── zcode-provider-check.js      # ¿el plan sirve desde un cliente externo?
+│   ├── zcode-provider-check.js      # ¿el plan sirve desde un cliente externo?
+│   └── plan-gateway-win.cjs          # gateway local: Start Plan -> API Anthropic (Windows)
 └── docs/
     ├── zcode-stack-reclamo-bono.md      # el stack paso a paso + los hallazgos
     ├── zcode-start-plan-como-provider.md # usar el plan como provider en otros harnesses
@@ -181,6 +182,56 @@ schtasks /create /tn "ZCode vigilante cupones" /tr "node ""<repo>\scripts\zcode-
 
 ---
 
+## Usar el Start Plan desde otro harness (gateway local)
+
+`scripts/plan-gateway-win.cjs` expone la cuota del Start Plan como **API Anthropic** en
+`127.0.0.1:3129`, para que la consuma Claude Code, OpenCode, Codex CLI o cualquier cliente
+Anthropic-compatible.
+
+```bash
+node scripts/plan-gateway-win.cjs
+
+curl -s http://127.0.0.1:3129/health
+# {"ok":true,"gateway":"plan-gateway","provider":"account:zai-start-plan","reasoning":"max","platform":"win32","port":3129}
+
+curl -s http://127.0.0.1:3129/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: local' \
+  -d '{"model":"GLM-5.3-Flash","max_tokens":64,"messages":[{"role":"user","content":"di OK"}]}'
+```
+
+En OpenCode:
+
+```jsonc
+{
+  "provider": {
+    "zcode-local": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "ZCode Start Plan (local)",
+      "options": { "apiKey": "local", "baseURL": "http://127.0.0.1:3129/v1" },
+      "models": { "GLM-5.3-Flash": { "name": "GLM 5.3 Flash (Start Plan local)" } }
+    }
+  }
+}
+```
+
+Dos cosas que hay que saber antes de usarlo:
+
+1. **No es un cliente de la API de Z.ai.** El endpoint del plan rechaza a cualquier cliente que no
+   sea la app oficial (`405 code 3012`). El gateway no llama al plan: spawnea el **app-server del
+   runtime real de ZCode** y deja que sea él quien se autentique.
+2. **Usa el CLI 0.17.0**, no el runtime 3.18.2 que trae la app de escritorio. El servidor valida el
+   *prompt de sistema* del runtime como marca de cliente oficial, y el prompt de 3.18.2 todavía no
+   está en la lista: el gateway devolvería `405 / 3012` aunque el token y la cuenta estén bien.
+   Pon el runtime en `glm-0.17.0/` (en la raíz del repo, o junto al script) o apunta
+   `ZCODE_GATEWAY_RUNTIME_DIR` a la carpeta que lo tenga.
+
+Detalle completo, con el método para capturar la petición real del runtime y hacer el bisect:
+[`docs/zcode-start-plan-como-provider.md`](docs/zcode-start-plan-como-provider.md) §3.1.
+
+---
+
 ## Variables de entorno
 
 | Variable | Default | Para qué |
@@ -193,6 +244,10 @@ schtasks /create /tn "ZCode vigilante cupones" /tr "node ""<repo>\scripts\zcode-
 | `ZCODE_CONFIG` | `<repo>\config.json` | Ruta a tu configuración |
 | `CDP_PORT` | `9222` | Puerto de depuración de Electron |
 | `ZV` | `3.18.2` | Versión de la API |
+| `PORT` | `3129` | Puerto del gateway local (`plan-gateway-win.cjs`) |
+| `ZCODE_GATEWAY_RUNTIME_DIR` | `<repo>\glm-0.17.0` | Carpeta con el runtime CLI 0.17.0 (`zcode.cjs` + `provider/`) |
+| `ZCODE_CLI_ENTRY` | — | Ruta directa a un `zcode.cjs` alternativo |
+| `ZCODE_GATEWAY_BUILTIN` | — | Ruta directa a un `zcode-builtin.json` alternativo |
 
 ---
 

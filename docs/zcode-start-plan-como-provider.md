@@ -144,6 +144,31 @@ Paseo además tiene su capa de recuperación en el sandbox:
   hace `paseo daemon restart` y luego `systemctl restart paseo-daemon.service`.
 - `paseo-healthcheck.timer` — lo dispara **cada 2 minutos**.
 
+### 1.4 Gateway local en Windows (port del sandbox)
+
+Además del túnel, el gateway se puede correr **en el propio Windows**, sin depender del sandbox:
+
+```bat
+rem C:\Users\<TU_USUARIO>\.zcode\ssh-proxy\plan-gateway-local.cmd
+:loop
+cd /d "%USERPROFILE%\Documents\<carpeta-del-repo>\zcodeh"
+node plan-gateway-win.cjs >> "%LOG%" 2>&1
+timeout /t 20 /nobreak >nul
+goto loop
+```
+
+Arranque: `plan-gateway-local.vbs` (carpeta de Inicio, oculto).
+
+- Escucha en `127.0.0.1:**3129**` (el **3128** queda para el túnel, para que convivan).
+- Lee el token del keyring de Windows, igual que el resto de los scripts de este repo.
+- Usa el **CLI 0.17.0** (`glm-0.17.0/zcode.cjs`) y no el runtime de la app de escritorio: ver
+  §3.1, es la diferencia entre que funcione o devuelva `405 / code 3012`.
+
+```bash
+curl -s http://127.0.0.1:3129/health
+# {"ok":true,"gateway":"plan-gateway","provider":"account:zai-start-plan","reasoning":"max","platform":"win32","port":3129}
+```
+
 ---
 
 ## 2. Cómo funciona el gateway por dentro
@@ -160,8 +185,8 @@ Paseo además tiene su capa de recuperación en el sandbox:
    //      ZCODE_PROVIDER_CONFIG_PATH=~/.zcode/v2/provider_config.json
    ```
 
-   `USE_ENTRY` es `~/zcode-cli/glm/zcode.cjs` en Linux y
-   `C:\Program Files\ZCode\resources\glm\zcode.cjs` en Windows — **el runtime viene dentro de la app**.
+   `USE_ENTRY` es `~/zcode-cli/glm/zcode.cjs` en Linux y, en Windows, el CLI 0.17.0 si está
+   disponible (`glm-0.17.0/zcode.cjs`), con el runtime de la app como fallback (§3.1).
 
 2. **Inyecta el provider del Start Plan** vía el método `provider/updateAccountConfig`:
 
@@ -264,6 +289,76 @@ credenciales locales solo hay `zcodejwttoken` (claims `user_id, token_version, s
 `exp`) y `oauth:zai:access_token` (claims `user_type, user_id, api_key, user_key, customer_id,
 username, customer`, con `api_key` **vacío**). Por eso el camino que funciona no es llamar a la
 API: es **dejar que el runtime de ZCode sea el que llama**.
+
+### 3.1 El chequeo de "cliente oficial" mira el PROMPT DE SISTEMA
+
+Este es el punto más contraintuitivo de todo el mecanismo, y se destapó al portar el gateway
+a Windows.
+
+Cuando el runtime 3.18.2 de Windows habla con el endpoint del plan, el servidor responde:
+
+```
+HTTP 405
+{"code":"3012","msg":"This client is not supported. Please use the official ZCode client.","logid":"..."}
+```
+
+Y el gateway se cae, aunque **todo lo demás esté correcto**. Lo que se verificó, por partes:
+
+| Comprobación | Resultado |
+|--------------|-----------|
+| ¿El token es el correcto? | **Sí** — el mismo `zcodejwttoken` funciona desde el sandbox y desde Windows |
+| ¿La cuenta es la misma? | **Sí** — mismo `user_id` (`<user_id>`), mismo `customer_id`, mismo `api_key` vacío |
+| ¿El builtin provider es el mismo? | **Sí** — `account:zai-start-plan` con `mode:start-plan`, `accountType:zai`, `baseUrl: https://zcode.z.ai/api/v1/zcode-plan/anthropic` (rev 43 en sandbox, rev 44 en Windows) |
+| ¿Cambian las cabeceras? | **No** — mismas claves, mismos valores salvo versión/plataforma/locale |
+| ¿Cambia el **cuerpo**? | **Sí** — y es la causa |
+
+El bisect (capturar la petición real que manda el runtime, reenviarla cambiando una variable a la vez)
+deja el resultado así:
+
+| Petición | Resultado |
+|----------|-----------|
+| cabeceras sandbox + cuerpo sandbox | HTTP 200 |
+| cabeceras Windows + cuerpo Windows | HTTP 405 / 3012 |
+| cabeceras **Windows** + cuerpo **sandbox** | **HTTP 200** |
+| cabeceras sandbox + cuerpo **Windows** | HTTP 405 / 3012 |
+| cuerpo sandbox con `metadata` de Windows | HTTP 200 |
+| cuerpo sandbox con `tools` de Windows | HTTP 200 |
+| cuerpo sandbox con `messages` de Windows | HTTP 200 |
+| cuerpo sandbox con `system` de Windows | HTTP 405 / 3012 |
+| cuerpo sandbox **sin** `system` | HTTP 405 / 3012 |
+
+O sea: el servidor valida el **prompt de sistema** que manda el runtime como marca de cliente
+oficial. Los dos prompts comparados:
+
+| Runtime | `system[0]` | Tamaño |
+|---------|-------------|--------|
+| 3.16.x (CLI 0.17.0) | `You are ZCode, an interactive coding agent` | 6.893 chars |
+| 3.18.2 (CLI 0.17.1) | `You are ZCode, an interactive agent` | 3.139 chars |
+
+El prompt de 3.18.2 todavía no está en la lista de clientes que acepta el servidor. Da igual que
+las cabeceras, el token y la cuenta sean correctos: sin `system` recognized, es `3012`.
+
+**Consecuencia práctica:** el gateway local de Windows (§1.4) corre el **CLI 0.17.0** con su
+`provider/zcode-builtin.json` (rev 43), no el runtime que trae la app de escritorio. Con el runtime
+0.17.1 el gateway devuelve `405 / 3012`; con el 0.17.0 responde normal.
+
+> Nota: el runtime 3.18.2 también pide un `session/requestRuntimePreferences` más estricto
+> (`nativeSearchEnhancementsEnabled` obligatorio, objeto `strict`) y usa
+> `interaction/requestProviderRuntimeHeaders` en vez de `interaction/requestAuth`. El gateway
+> detecta la versión del runtime (`<entry> --version`) y manda el payload que corresponde.
+
+#### Cómo capturar la petición real del runtime (método reutilizable)
+
+El truco para ver qué manda el runtime de verdad es redirigir su `baseUrl` a un servidor local, sin
+tocar el servidor de Z.ai:
+
+1. Copiar el builtin provider config y cambiarle el `baseUrl` del provider `start-plan` a
+   `http://127.0.0.1:<puerto>/api/v1/zcode-plan/anthropic`.
+2. Levantar un HTTP server local que logue `method`, `url`, headers y body, y que responda algo.
+3. Arrancar el gateway con `ZCODE_GATEWAY_BUILTIN=<builtin parcheado>`.
+4. Un `POST` al gateway y listo: en el log queda la petición completa que el runtime firmaría.
+5. Para reenviarla tal cual al endpoint real y ver qué acepta el servidor, sustituye el
+   `authorization` / `x-api-key` por el token local (es el mismo) y haz `fetch` con esos headers.
 
 ### El mapa de cabeceras oficiales
 
@@ -372,6 +467,11 @@ codex
    `enc:v1:` con secreto fallback).
 8. **`billing/preview` no consume entrega; `marketing/touch` sí.** Para saber si hay campaña usa
    `preview` (ver `zcode-stack-reclamo-bono.md` §5.1).
+9. **`405 / 3012` también se dispara con todo correcto.** El servidor valida el *prompt de
+   sistema* del runtime, no solo las cabeceras. Un runtime más nuevo puede quedar fuera de la
+   lista de clientes oficiales aunque el token, la cuenta y el provider sean los mismos (§3.1).
+10. **El runtime que trae la app de escritorio puede no servir para el Start Plan.** En 3.18.2
+    (CLI 0.17.1) el prompt ya no es reconocido; el CLI 0.17.0 sí. El gateway local usa el 0.17.0.
 
 ---
 
@@ -385,6 +485,9 @@ codex
 | Con `access_token` de OAuth: 401 / 429 / 200-con-error | Verificado |
 | El mapa de cabeceras oficiales (`Authorization`, `X-Bigmodel-Authorization`, `x-coding-plan-api-key`, `Bigmodel-*`) | Verificado en el bundle |
 | El gateway local expone Anthropic Messages API y traduce al app-server | Verificado **en vivo** (respuesta de GLM-5.3-Flash) |
+| El gateway local **en Windows** (sin sandbox) expone lo mismo en `127.0.0.1:3129` | Verificado en vivo (`usage: {input_tokens: 21152, output_tokens: 4}`), streaming y no-streaming |
+| El `405 / 3012` del runtime 3.18.2 se debe al **prompt de sistema**, no a token/cuenta/cabeceras | Verificado por bisect de la petición real (§3.1) |
+| El CLI 0.17.0 (3.16.x) sí es aceptado por el endpoint del plan | Verificado en vivo desde Windows |
 | OpenCode lo consume vía `@ai-sdk/anthropic` sobre `http://127.0.0.1:3128/v1` | Verificado en la config activa |
 | Paseo lo consume con el provider `zai-start-plan` (`extends: claude`) | Verificado en `~/.paseo/config.json` |
 | El provider `zcode` de Paseo (`extends: acp`) | Existe pero está **deshabilitado** |
