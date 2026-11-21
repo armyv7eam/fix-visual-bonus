@@ -3,74 +3,230 @@
 Este documento responde una pregunta concreta: **¿puedo gastar los tokens del Start Plan
 (campaña) desde Claude Code, Codex CLI, OpenCode, un MCP server o un `curl`?**
 
-La respuesta corta tiene tres partes, y conviene no mezclarlas porque son productos distintos
-con el nombre parecido:
+La respuesta corta tiene tres capas, y conviene no mezclarlas porque son mecanismos distintos:
 
-| Capa | Qué es | ¿Sirve fuera de ZCode? |
-|------|--------|------------------------|
-| **Start Plan de campaña** | El bono que se reclama en el banner (p. ej. `zcode-v3-start-plan-wk-1120`, 500.000.000 tokens de `GLM-5.3-Flash`) | **No.** El servidor lo rechaza: `This client is not supported. Please use the official ZCode client.` |
-| **Carril "official auth"** | Los MCP servers y plugins que **corren dentro de ZCode** piden al host las cabeceras oficiales y hablan con el modelo usando la cuenta del usuario | **Sí, pero solo desde dentro de ZCode** |
-| **Coding Plan de Z.ai** | Producto con API key propia en la consola de Z.ai (crédito aparte) | **Sí.** Es la vía normal para un harness externo |
+| Capa | Mecanismo | ¿Sirve fuera de ZCode? |
+|------|-----------|------------------------|
+| **Llamada HTTP directa** al endpoint del plan (`zcode.z.ai/api/v1/zcode-plan/...`) | el harness habla directo con la API | **No.** El servidor lo rechaza: `This client is not supported. Please use the official ZCode client.` |
+| **Gateway local + app-server de ZCode** | un servicio translates Anthropic Messages → **el runtime real de ZCode** (`zcode.cjs app-server`), que es quien sí sabe autenticarse | **Sí.** Es como está funcionando hoy en OpenCode y en Paseo |
+| **Coding Plan de Z.ai** | producto con API key propia en la consola de Z.ai (crédito aparte) | **Sí**, pero es otro producto y **no** usa los tokens del bono |
 
-Todo lo de abajo está verificado contra la app instalada (ZCode 3.18.2) y contra los servidores de
-Z.ai. Los comandos son reproducibles con `scripts/zcode-provider-check.js`.
+Todo lo de abajo está verificado contra la app instalada (ZCode 3.18.2), contra los servidores de
+Z.ai y contra la instalación que está corriendo ahora mismo.
 
 ---
 
-## 1. Anatomía de la llamada
+## 1. La arquitectura que está funcionando hoy
 
-Definida en el bundle del renderer (`out/renderer/assets/validation-*.js`):
-
-```js
-zcodePlanOpenAiBaseUrl:    `${origin}/api/v1/zcode-plan`
-zcodePlanAnthropicBaseUrl: `${origin}/api/v1/zcode-plan/anthropic`
-zcodePlanBillingCurrentUrl: `${origin}/api/v1/zcode-plan/billing/current`
-zcodePlanBillingBalanceUrl: `${origin}/api/v1/zcode-plan/billing/balance`
+```
+OpenCode (Windows)                 Paseo (sandbox)
+  provider "zcode"                   provider "zai-start-plan" (extends: claude)
+  @ai-sdk/anthropic                  ANTHROPIC_BASE_URL=http://127.0.0.1:3128
+  http://127.0.0.1:3128/v1           model GLM-5.3-Flash
+        |                                   |
+        +----------- ssh -L 3128 ------------+
+                        |
+        sandbox instabox-zcode : 127.0.0.1:3128
+        systemd: plan-gateway.service -> node /data/home/plan-gateway.cjs
+                        |
+                        |  por cada request, spawnea:
+                        v
+        zcode.cjs app-server --surface terminal --no-color
+          (el runtime real de ZCode, 15 MB, va incluido en la app)
+          + provider account:zai-start-plan  (entitled)
+          + reasoningLevel: max
+                        |
+                        |  interaction/requestProviderRuntimeHeaders
+                        |  -> { apiKey: zcodejwttoken, headers: {...} }
+                        v
+                  https://zcode.z.ai  (cuenta del sandbox, cuota del Start Plan)
 ```
 
-Con `origin = https://zcode.z.ai`. La ruta final del protocolo Anthropic es
-`POST /api/v1/zcode-plan/anthropic/v1/messages`.
+### 1.1 En el lado Windows (este equipo)
 
-El host clasifica el tipo de provider por la ruta de la base URL
-(`resolvePresetProviderKindFromRuntimeBaseUrl`):
+El túnel lo abre un `.cmd` con failover, arrancado de forma oculta desde la carpeta de Inicio:
 
-- ruta con `/coding/paas/v4` → `openai-compatible`
-- ruta con `/api/anthropic` o `/zcode-plan/anthropic` → `anthropic`
+```bat
+rem C:\Users\<TU_USUARIO>\.zcode\ssh-proxy\plan-gateway-tunnel.cmd
+:loop
+curl -s -m 5 http://127.0.0.1:3128/health >nul 2>&1
+if %ERRORLEVEL% EQU 0 goto wait
+ssh -N -L 3128:127.0.0.1:3128 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 ^
+  -o ExitOnForwardFailure=yes -o ConnectTimeout=20 -o BatchMode=yes instabox-zcode
+rem si el sandbox primario cae (cooldown), prueba instabox-zcode-dev
+timeout /t 20 /nobreak >nul
+goto loop
+```
 
-**El Start Plan solo tiene ruta Anthropic.** La base "OpenAI-compatible" no expone
-`/chat/completions` (responde `404 page not found`).
+Arranque: `plan-gateway-tunnel.vbs` (carpeta Inicio, oculto).
 
-### Modelos
+El provider de OpenCode (`~/.config/opencode/opencode.json`):
 
-Del endpoint `GET /api/v1/client/configs?app_version=3.18.2&platform=win32-x64`:
-`GLM-5.3-Flash`, `GLM-5.3`, `GLM-5-Turbo`, `GLM-5.2`. El que consume el Start Plan es
-**`GLM-5.3-Flash`** (es el `show_name` del bucket en `billing/balance`).
-
-### Cabeceras del cliente oficial
-
-Mapa literal en el host (`out/host/index.js`):
-
-```js
+```jsonc
 {
-  authorization:            "Authorization",
-  codingPlanAuthorization:  "X-Bigmodel-Authorization",
-  targetType:               "Bigmodel-Target-Type",
-  organization:             "Bigmodel-Organization",
-  project:                  "Bigmodel-Project"
+  "provider": {
+    "zcode": {
+      "npm": "@ai-sdk/anthropic",          // <-- protocolo Anthropic
+      "name": "ZCode (plan-gateway)",
+      "options": { "apiKey": "local", "baseURL": "http://127.0.0.1:3128/v1" },
+      "models": { "GLM-5.3-Flash": { "name": "GLM 5.3 Flash (ZCode Start Plan)" } }
+    }
+  }
 }
-// + cabecera suelta: "x-coding-plan-api-key"
-// + x-api-key (opcional, segun el provider)
-// + accountScope: 64 caracteres hexadecimales
 ```
 
-Los modos de provider que reconoce la app:
-`start-plan`, `individual-coding-plan`, `team-coding-plan`, `off-peak`, `highspeed`.
+El `apiKey` es un dummy: el gateway **ignora** la cabecera de auth y pone la oficial.
+
+### 1.2 En el sandbox (`instabox-zcode`)
+
+El gateway corre como servicio systemd:
+
+```ini
+# /etc/systemd/system/plan-gateway.service
+[Unit]
+Description=Plan Gateway (cuota Start Plan -> API Anthropic)
+[Service]
+ExecStart=/usr/local/bin/node /data/home/plan-gateway.cjs
+Restart=always
+Environment=HOME=/data/home
+User=<usuario>
+WorkingDirectory=/data/home
+[Install]
+WantedBy=multi-user.target
+```
+
+Y expone dos rutas:
+
+| Ruta | Qué es |
+|------|--------|
+| `GET /health` | `{"ok":true,"gateway":"plan-gateway","provider":"account:zai-start-plan","reasoning":"max"}` |
+| `POST /v1/messages` | Anthropic Messages API: streaming SSE y no-streaming |
+
+### 1.3 En Paseo
+
+`/data/home/.paseo/config.json` → `agents.providers`:
+
+```jsonc
+{
+  "zai-start-plan": {
+    "extends": "claude",                 // -> Claude Code CLI
+    "label": "ZCode Start Plan (GLM)",
+    "env": {
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:3128",
+      "ANTHROPIC_AUTH_TOKEN": "...",
+      "API_TIMEOUT_MS": "3000000"
+    },
+    "disallowedTools": ["WebSearch"],
+    "models": [
+      { "id": "GLM-5.3-Flash", "isDefault": true },
+      { "id": "GLM-5.3" }
+    ],
+    "enabled": true
+  },
+  "zcode": {
+    "extends": "acp",                    // -> ZCode app-server por Agent Client Protocol
+    "command": ["/usr/local/bin/zcode", "app-server"],
+    "enabled": false                     // <- hoy está apagado
+  },
+  "muse": { "enabled": false },
+  "antigravity": { "enabled": false }
+}
+```
+
+Ojo con la distinción: el provider `zai-start-plan` **no** usa ZCode como agente — usa **Claude
+Code** apuntando al gateway. El provider `zcode` sí usa ZCode como agente (vía ACP), pero está
+deshabilitado. Son dos caminos distintos al mismo Start Plan.
+
+Paseo además tiene su capa de recuperación en el sandbox:
+
+- `paseo-daemon.service` — "Paseo daemon (VPS zcode dedicado)".
+- `/usr/local/bin/paseo-healthcheck.sh` — comprueba `paseo daemon status --json` y, si no responde,
+  hace `paseo daemon restart` y luego `systemctl restart paseo-daemon.service`.
+- `paseo-healthcheck.timer` — lo dispara **cada 2 minutos**.
 
 ---
 
-## 2. La matriz verificada
+## 2. Cómo funciona el gateway por dentro
 
-`node scripts/zcode-provider-check.js` (no imprime ningún secreto; solo códigos del servidor):
+`plan-gateway.cjs` (11 KB, Node puro, sin dependencias) hace esto en cada request:
+
+1. **Levanta un app-server de ZCode fresco** por turno:
+
+   ```js
+   spawn('node', [USE_ENTRY, 'app-server', '--surface', 'terminal', '--no-color'], { env })
+   // env: ZCODE_BASE_URL=https://zcode.z.ai
+   //      ZCODE_APP_VERSION=0.17.0
+   //      ZCODE_PROVIDER_CONFIG=<zcode-builtin.json>
+   //      ZCODE_PROVIDER_CONFIG_PATH=~/.zcode/v2/provider_config.json
+   ```
+
+   `USE_ENTRY` es `~/zcode-cli/glm/zcode.cjs` en Linux y
+   `C:\Program Files\ZCode\resources\glm\zcode.cjs` en Windows — **el runtime viene dentro de la app**.
+
+2. **Inyecta el provider del Start Plan** vía el método `provider/updateAccountConfig`:
+
+   ```js
+   providers: {
+     'account:zai-start-plan': {
+       access: { type: 'zhipu-account', entitled: true },
+       builtinModelIds: ['GLM-5.3-Flash', 'GLM-5.3', 'GLM-5.2', 'GLM-5-Turbo'],
+     }
+   },
+   states: { 'account:zai-start-plan': { availability: 'available', entitled: true, current: true } },
+   ```
+
+3. **Responde la petición de cabeceras oficiales** que el app-server le hace al cliente. El método
+   **cambia según la versión**:
+
+   | Versión del runtime | Método que hay que responder |
+   |--------------------|------------------------------|
+   | 3.16.x (sandbox) | `interaction/requestAuth` |
+   | **3.18.2 (Windows)** | **`interaction/requestProviderRuntimeHeaders`** |
+   | 3.18.2 | `interaction/requestOfficialMcpAuthHeaders` (otro carril, para MCP) |
+
+   La respuesta es la misma en ambos casos:
+
+   ```js
+   {
+     headersApplied: true,
+     requestAuth: {
+       apiKey: planToken,                       // el zcodejwttoken
+       headers: {
+         'http-referer': 'https://zcode.z.ai',
+         'user-agent': `ZCode/${APP_VERSION}`,
+         'x-zcode-app-version': APP_VERSION,
+         'x-title': 'Z Code@cli',
+       },
+     },
+   }
+   ```
+
+4. **Conduce la sesión**: `session/create` → `session/subscribe` → `session/setMode` (`bypass`) →
+   `provider/updateAccountConfig` → `session/setModel` (con `reasoningLevel: 'max'`) →
+   `session/send`, y escucha `session/event` (`model.streaming`, `turn.completed`, `turn.failed`).
+
+5. **Traduce a Anthropic**: el `POST /v1/messages` del gateway devuelve
+   `{id, type:'message', role:'assistant', model, content:[{type:'text',text}], stop_reason:'end_turn', usage}`.
+   En streaming emite `message_start` → `content_block_start` → `content_block_delta` → `message_stop`.
+
+### De dónde sale el token
+
+`~/.zcode/v2/credentials.json`, clave `zcodejwttoken`. Ojo con el cifrado: **no es el mismo en
+Linux y en Windows**.
+
+| Plataforma | Formato | Clave del cifrado |
+|-----------|---------|-------------------|
+| Windows | `enc:v2:os:<sha256(clave)[0:24]>:\<iv>.<tag>.<data>` | keyring de Windows, cuenta `sha256(path.resolve(credentials.json))` |
+| Linux | `enc:v1:<iv>.<tag>.<data>` | secreto **fallback** derivado del home: `zcode-credential-fallback:linux:<home>:<usuario>` |
+
+En Linux no hay keyring de Windows, así que el CLI usa ese fallback. Quien replique esto en un
+Linux propio necesita el mismo fallback para su usuario, o las credenciales no se descifran.
+
+---
+
+## 3. Por qué la llamada HTTP directa NO funciona (y por qué eso no importa)
+
+`node scripts/zcode-provider-check.js` (no imprime ningún secreto):
 
 ```
 [BLOQUEADO] HTTP 405  Start Plan Anthropic (zcode.z.ai) + zcodejwttoken
@@ -98,125 +254,77 @@ Detalles que importan:
 - **`401`** con el `access_token` de OAuth: ese token no es una credencial válida para el
   endpoint del plan.
 - **`429 [1113] Insufficient balance`** en `api.z.ai`: el token es aceptado, pero el producto
-  público cobra **saldo de API**, que es distinto del bucket del Start Plan. Esta cuenta no tiene
-  saldo de API.
+  público cobra **saldo de API**, que es distinto del bucket del Start Plan.
 - **`HTTP 200` con `{"error":{"code":"500"}}`** es una trampa: el status 200 no significa éxito.
   Siempre mira el cuerpo, no solo el código HTTP.
 
-### De dónde sale la credencial que sí funciona
+La razón de fondo: **la coding plan API key que el endpoint quiere la resuelve la app contra el
+servidor por sesión** (`accountRequestAuthService.resolveCurrent`), y no está en el disco. En las
+credenciales locales solo hay `zcodejwttoken` (claims `user_id, token_version, sub, iat`, sin
+`exp`) y `oauth:zai:access_token` (claims `user_type, user_id, api_key, user_key, customer_id,
+username, customer`, con `api_key` **vacío**). Por eso el camino que funciona no es llamar a la
+API: es **dejar que el runtime de ZCode sea el que llama**.
 
-La app resuelve internamente una **coding plan API key** por cuenta. En el código:
+### El mapa de cabeceras oficiales
 
-- `resolveCodingPlanApiKeyError` → errores `zai_coding_plan_api_key_required` /
-  `bigmodel_coding_plan_api_key_required`.
-- `accountRequestAuthService.resolveCurrent(...)` → devuelve `{ apiKey, apiKeyId, accountScope }`.
-- Esa key **no está en `credentials.json`**: se pide al servidor por sesión. En las credenciales
-  locales solo hay `zcodejwttoken` (claims: `user_id, token_version, sub, iat`, sin `exp`) y
-  `oauth:zai:access_token` (claims: `user_type, user_id, api_key, user_key, customer_id,
-  username, customer`, con `api_key` **vacío**).
+Está en el bundle del host (`out/host/index.js`):
 
-Por eso **no hay forma de copiar la credencial a un cliente externo**: no está en el disco.
+```js
+{
+  authorization:           "Authorization",
+  codingPlanAuthorization: "X-Bigmodel-Authorization",
+  targetType:              "Bigmodel-Target-Type",
+  organization:            "Bigmodel-Organization",
+  project:                 "Bigmodel-Project"
+}
+// + cabecera suelta: "x-coding-plan-api-key"
+// + accountScope: 64 caracteres hexadecimales
+```
+
+Los modos de provider que reconoce la app:
+`start-plan`, `individual-coding-plan`, `team-coding-plan`, `off-peak`, `highspeed`.
 
 ---
 
-## 3. La vía que sí funciona: "official auth" para MCP dentro de ZCode
+## 4. Probar el gateway
 
-Acá está el camino real para un harness: que corra **dentro de ZCode** como MCP server o plugin.
-El host de ZCode le resuelve las cabeceras oficiales y el MCP server llama al modelo con la
-cuenta del usuario (plan incluido).
+```bash
+curl -s http://127.0.0.1:3128/health
+# {"ok":true,"gateway":"plan-gateway","provider":"account:zai-start-plan","reasoning":"max"}
 
-### Contrato del canal `official-mcp`
-
-Petición (enviada por el MCP server al host de ZCode):
-
-```ts
-type OfficialMcpAuthRequest = {
-  requestId: string;
-  workspace: Workspace;          // workspace del usuario
-  pluginId: string;              // id del plugin/mcp
-  consumer: 'mcp-server' | 'plugin-command';
-  mcpKey?: string;               // OBLIGATORIO si consumer === 'mcp-server'
-  targetOrigin: string;          // https://... origen del MCP server
-};
+curl -s http://127.0.0.1:3128/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: local' \
+  -d '{"model":"GLM-5.3-Flash","max_tokens":64,"messages":[{"role":"user","content":"di OK"}]}'
 ```
 
-Respuesta:
+Prueba real registrada durante la verificación de este documento: respuesta de `GLM-5.3-Flash`
+con `usage: {input_tokens: 20072, output_tokens: 192}`.
 
-```ts
-type OfficialMcpAuthResponse =
-  | { ok: true;  headers: Record<string, string> }   // cabeceras oficiales
-  | { ok: false; reason:
-        | 'official_auth_unavailable'      // el host no tiene resolver de cabeceras
-        | 'official_auth_plan_required'     // la cuenta no tiene plan de codificacion
-        | 'official_mcp_origin_untrusted' };// el targetOrigin no es de confianza
-```
-
-Reglas que aplica el host:
-
-1. Valida `targetOrigin` contra los orígenes de confianza. En desarrollo se aceotan por la variable
-   de entorno `ZCODE_OFFICIAL_MCP_DEV_TRUSTED_ORIGINS`.
-   Si no valida → `official_mcp_origin_untrusted`.
-2. Si no hay resolver de cabeceras → `official_auth_unavailable`.
-3. Si la cuenta no tiene plan de codificación → `official_auth_plan_required`.
-4. Devuelve el mapa de cabeceras (`Authorization`, `X-Bigmodel-Authorization`,
-   `x-coding-plan-api-key`, `Bigmodel-Target-Type`, …) y opcionalmente un `accountScope` de 64 hex.
-
-### Esqueleto de un MCP server que usa el plan
-
-```ts
-// 1) pedir las cabeceras oficiales al host de ZCode
-const res = await host.request('official-mcp', {
-  requestId: crypto.randomUUID(),
-  workspace,
-  pluginId: 'mi-plugin',
-  consumer: 'mcp-server',
-  mcpKey: '<clave del mcp server>',
-  targetOrigin: 'https://mi-plugin.local',
-});
-
-if (!res.ok) throw new Error(`official auth no disponible: ${res.reason}`);
-
-// 2) llamar al modelo con esas cabeceras
-const r = await fetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages', {
-  method: 'POST',
-  headers: {
-    'content-type': 'application/json',
-    'anthropic-version': '2023-06-01',
-    ...res.headers,
-  },
-  body: JSON.stringify({
-    model: 'GLM-5.3-Flash',
-    max_tokens: 1024,
-    messages: [{ role: 'user', content: 'hola' }],
-  }),
-});
-```
-
-> Estado: el contrato está verificado leyendo el bundle (`out/host/index.js`,
-> `out/host/chunk-*.js`, `out/main/chunk-*.js`). **La llamada en vivo desde un MCP server real
-> dentro de ZCode queda pendiente de validar en runtime**: si te sirve, es el siguiente paso
-> natural y se puede montar en 10 minutos con un MCP server de prueba.
+> Ojo con el costo: cada request **spawnea un app-server nuevo** y el `system` prompt del runtime
+> pesa ~20k tokens de entrada. Para uso intensivo conviene un app-server persistente en vez de
+> uno por turno.
 
 ---
 
-## 4. Harness externo: Coding Plan de Z.ai (producto aparte)
+## 5. Harness externo: Coding Plan de Z.ai (producto aparte)
 
-Si lo que quieres es **un harness externo** (Claude Code, Codex CLI, OpenCode…), lo que funciona
-es el **Coding Plan de Z.ai**: se compra en la consola de Z.ai, genera una **API key propia** y
-esa key es la que consumes. **No usa los tokens del bono de campaña** y **no requiere ZCode
-instalado**.
+Si lo que quieres es **un harness externo** (Claude Code, Codex CLI, OpenCode…) lo que funciona
+sin nada de ZCode es el **Coding Plan de Z.ai**: se compra en la consola de Z.ai, genera una **API
+key propia** y esa key es la que consumes. **No usa los tokens del bono de campaña** y **no
+requiere ZCode instalado**.
 
 > Estado de verificación: la API key propia no se pudo probar en esta máquina (esta cuenta no
-> tiene saldo de API). Los endpoints y el formato de llamada de esta sección salen del bundle de
-> la app y de la documentación pública de Z.ai, y coinciden con lo que la propia app usa para el
-> preset `bigmodelIndividualCodingPlan`.
+> tiene saldo de API). Los endpoints salen del bundle de la app y de la documentación pública de
+> Z.ai.
 
 ### Claude Code (protocolo Anthropic)
 
 ```bash
 export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
 export ANTHROPIC_AUTH_TOKEN="<tu API key de Z.ai>"
-export ANTHROPIC_MODEL="GLM-4.6"      # o el modelo que tengas contratado
+export ANTHROPIC_MODEL="GLM-4.6"
 claude
 ```
 
@@ -232,7 +340,6 @@ codex
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "zai": {
       "npm": "@ai-sdk/openai-compatible",
@@ -245,73 +352,44 @@ codex
 }
 ```
 
-### curl de humo
-
-```bash
-curl -s https://api.z.ai/api/coding/paas/v4/chat/completions \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"glm-4.6","messages":[{"role":"user","content":"di OK"}],"max_tokens":16}'
-```
-
-### OpenCode como cliente del Start Plan dentro de ZCode
-
-La app ya trae OpenCode embebido y sabe resolver el Start Plan como provider
-(`resolveOpenCodeProviderDefaultKind`). Si quieres el mismo motor fuera de la app, la forma
-soportada es la del punto 3: el MCP server pide la official auth al host.
-
----
-
-## 5. Cómo revisar el estado desde tu máquina
-
-```powershell
-node scripts/zcode-provider-check.js      # matriz endpoint x credencial (sin imprimir secretos)
-node scripts/zcode-start-plan-status.js   # plan activo y saldo del Start Plan
-node scripts/zcode-cuentas-preview.js     # campanas disponibles por cuenta (no consume entrega)
-```
-
-Para ver **qué credenciales** hay en tu disco (sin mostrarlas):
-
-```powershell
-node scripts/zcode-provider-check.js
-# imprime solo longitudes y nombres de claim
-```
-
-El `zcodejwttoken` **no expira** (no tiene `exp`); el `oauth:zai:access_token` es un JWT de
-negocio ("MaaS") que el servidor refresca por su cuenta.
-
 ---
 
 ## 6. Trampas
 
 1. **Un `HTTP 200` no significa éxito.** `api.z.ai` devuelve `200` con
    `{"error":{"code":"500"}}` cuando la credencial no sirve. Siempre parsea el cuerpo.
-2. **`405 code 3012` no es un problema de token.** Es el chequeo de cliente oficial: la credencial
-   era válida y el servidor te dijo que no eres la app.
-3. **`x-api-key` con el `access_token` de OAuth no es la coding plan API key.** La key real la
-   resuelve la app contra el servidor por sesión; no está en el disco.
-4. **Bearer y `x-api-key` no son equivalentes** en `api.z.ai`: con Bearer el token se trata como
-   API key de pago (saldo), con `x-api-key` como credencial de plan. Por eso una da 429 y la otra
-   da otro error.
-5. **El Start Plan no tiene ruta OpenAI-compatible.** Solo Anthropic. Un harness que solo hable
-   OpenAI no puede consumirlo directamente.
-6. **`billing/preview` no consume entrega; `marketing/touch` sí.** Al sondear para saber si hay
-   campaña, usa `preview` (ver `docs/zcode-stack-reclamo-bono.md` §5.1).
+2. **`405 code 3012` no es un problema de token.** Es el chequeo de cliente oficial.
+3. **El método de auth cambió de nombre entre versiones.** `interaction/requestAuth` (3.16.x) vs
+   `interaction/requestProviderRuntimeHeaders` (3.18.2). Un gateway que responde solo uno de los
+   dos se queda colgado en la versión nueva.
+4. **`x-api-key` con el `access_token` de OAuth no es la coding plan API key.** La key real la
+   resuelve la app contra el servidor por sesión.
+5. **Bearer y `x-api-key` no son equivalentes** en `api.z.ai`: con Bearer el token se trata como
+   API key de pago (saldo), con `x-api-key` como credencial de plan.
+6. **El Start Plan no tiene ruta OpenAI-compatible.** Solo Anthropic. Un harness que solo hable
+   OpenAI necesita el gateway (que traduce) o el Coding Plan de Z.ai.
+7. **El cifrado de credenciales difiere entre Windows y Linux** (`enc:v2:os:` con keyring vs
+   `enc:v1:` con secreto fallback).
+8. **`billing/preview` no consume entrega; `marketing/touch` sí.** Para saber si hay campaña usa
+   `preview` (ver `zcode-stack-reclamo-bono.md` §5.1).
 
 ---
 
-## 7. Qué quedó verificado y qué no
+## 7. Estado de verificación
 
 | Afirmación | Estado |
 |------------|--------|
-| El Start Plan expone `POST /api/v1/zcode-plan/anthropic/v1/messages` | Verificado (responde, no 404) |
-| El modelo del plan es `GLM-5.3-Flash` | Verificado (`billing/balance` + `client/configs`) |
+| El Start Plan expone `POST /api/v1/zcode-plan/anthropic/v1/messages` (modelo `GLM-5.3-Flash`) | Verificado |
+| La base "OpenAI-compatible" del plan no tiene `/chat/completions` | Verificado (404) |
 | Un cliente externo con `zcodejwttoken` recibe `405 code 3012` | Verificado |
-| Un cliente externo con `access_token` recibe 401 / 429 / 200-con-error | Verificado |
+| Con `access_token` de OAuth: 401 / 429 / 200-con-error | Verificado |
 | El mapa de cabeceras oficiales (`Authorization`, `X-Bigmodel-Authorization`, `x-coding-plan-api-key`, `Bigmodel-*`) | Verificado en el bundle |
-| El contrato del canal `official-mcp` (request/response/errores) | Verificado en el bundle |
-| La official auth resuelta alcanza para llamar al modelo desde un MCP server | **Pendiente de validar en runtime** |
-| El Coding Plan de Z.ai con API key propia funciona desde un harness externo | Documentado por el proveedor y por el bundle; no probado en esta máquina (sin saldo de API) |
+| El gateway local expone Anthropic Messages API y traduce al app-server | Verificado **en vivo** (respuesta de GLM-5.3-Flash) |
+| OpenCode lo consume vía `@ai-sdk/anthropic` sobre `http://127.0.0.1:3128/v1` | Verificado en la config activa |
+| Paseo lo consume con el provider `zai-start-plan` (`extends: claude`) | Verificado en `~/.paseo/config.json` |
+| El provider `zcode` de Paseo (`extends: acp`) | Existe pero está **deshabilitado** |
+| El método de auth en el runtime de Windows 3.18.2 | Verificado (`interaction/requestProviderRuntimeHeaders`) |
+| El Coding Plan de Z.ai con API key propia desde un harness externo | Documentado por el proveedor; no probado aquí (sin saldo de API) |
 
 ---
 
