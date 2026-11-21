@@ -1,0 +1,10 @@
+{
+  "_comentario": "Copia este archivo como config.json en la raiz del repo y declara TUS cuentas. config.json esta en .gitignore: no se versiona. Aqui no van tokens ni llaves, solo que cuentas seguir y como.",
+  "cuentas": [
+    "mi-cuenta@ejemplo.com",
+    "otra-cuenta@ejemplo.com"
+  ],
+  "modoVigilante": "avisar",
+  "cadaMinutos": 15,
+  "campana": null
+}

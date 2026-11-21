@@ -1,0 +1,30 @@
+# Configuracion personal del usuario (correos, preferencias) — nunca se versiona
+config.json
+
+# Secretos y material local — NUNCA deben versionarse
+vault/
+.zcode-keyring/
+*.vault
+*.enc
+.env
+.env.*
+credentials.json
+
+# Logs y artefactos de runtime
+*.log
+
+# Temporales del laboratorio
+.tmp-*
+*.tmp-*
+
+# Evidencia binaria (capturas del banner): se quedan en el workspace local
+*.png
+*.jpg
+*.jpeg
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Paquetes generados localmente
+*.zip
